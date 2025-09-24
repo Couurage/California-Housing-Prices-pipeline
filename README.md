@@ -110,6 +110,5 @@ pip install pandas numpy matplotlib scikit-learn folium kagglehub
 
 ---
 
-**Лицензия:** MIT (или укажите вашу).  
-**Автор:** (вставьте своё имя/ник).
+**Автор:** (Couurage).
 
