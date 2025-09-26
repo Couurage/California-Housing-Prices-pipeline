@@ -11,10 +11,12 @@ Original file is located at
 """
 
 # !pip install folium
-# !pip install scikit-learn
+# !pip install -U scikit-learn
 # !pip install pandas
 # !pip install numpy
 # !pip install matplotlib
+# !pip install catboost
+!pip install lightgbm
 
 """Импорты:"""
 
@@ -25,9 +27,12 @@ import folium
 from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, RidgeCV, LassoCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
+from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+from lightgbm import LGBMRegressor
 
 import kagglehub
 from kagglehub import KaggleDatasetAdapter
@@ -169,7 +174,7 @@ for lat_bin, lon_bin, med in grid.itertuples(index=False):
 m
 
 # оставляем только выбросы
-outliers = df[df["population_per_household_log"] > np.log1p(100)] # Apply log to 100 for comparison
+outliers = df[df["population_per_household_log"] > np.log1p(100)]
 
 # создаём карту (центрируем по средним координатам)
 m = folium.Map(
@@ -189,7 +194,7 @@ for _, row in outliers.iterrows():
         popup=f"population_per_household_log: {row['population_per_household_log']:.2f}" # Display log value
     ).add_to(m)
 
-m  # в Jupyter отобразится карта
+m
 
 """### Выводы по тепловой карте цен жилья
 
@@ -248,15 +253,12 @@ df.columns
 
 num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
 
-# Создаём скейлер и применяем
 scaler = MinMaxScaler(feature_range=(0, 1))
 X_mmscaled = X.copy()
 X_mmscaled[num_cols] = scaler.fit_transform(X[num_cols])
 
-# Проверим результат
 print(X_mmscaled[num_cols].agg(['min','mean','max']).round(4).T.head())
 
-# Если нужен итоговый DataFrame с целевой
 df_scaled = pd.concat([X_mmscaled, y], axis=1)
 
 """Заебись, теперь у нас есть версия отстандартскейленная и отминмаксскейленная версия. Но теперь нужно будет сравнить."""
@@ -269,7 +271,7 @@ cols_to_vs = df.select_dtypes(include="number").drop("median_house_value_log", a
 cols_to_vs
 
 for col in cols_to_vs:
-    fig, axes = plt.subplots(1, 3, figsize=(10, 2))
+    fig, axes = plt.subplots(1, 3, figsize=(12, 2))
 
     axes[0].hist(df[col].dropna(), bins=100, edgecolor="black")
     axes[0].set_title(f"{col} оригинал")
@@ -293,5 +295,136 @@ X_train, X_test, y_train, y_test = train_test_split(
     shuffle=True         # перемешиваем (по умолчанию True)
 )
 
-print("Train shape:", X_train.shape, y_train.shape)
-print("Test shape:", X_test.shape, y_test.shape)
+print("Обучающая выборка:", X_train.shape, y_train.shape)
+print("Тестовая:", X_test.shape, y_test.shape)
+
+"""---
+
+# Начинаем обучение разных моделей и их сравнение
+"""
+
+results = pd.DataFrame(columns=["Model", "MSE", "RMSE", "MAE", "R2"])
+
+# Функция для добавления оценок в results, в будущем будем юзать для сравнения
+def add_results(name, y_true, y_pred):
+    mse  = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+
+    global results
+    results = pd.concat([
+        results,
+        pd.DataFrame([{
+            "Model": name,
+            "MSE": mse,
+            "RMSE": rmse,
+            "MAE": mae,
+            "R2": r2
+        }])
+    ], ignore_index=True)
+
+"""# Обучение модели (Линейная регрессия)"""
+
+linreg = LinearRegression()
+linreg.fit(X_train, y_train)
+
+y_pred_lr = linreg.predict(X_test)
+
+add_results("LinearRegression", y_test, y_pred_lr)
+
+"""Модель линейной регрессии показала R² ≈ 0.67, RMSE ≈ 0.33 и MAE ≈ 0.25 — результат нормальный, но требует улучшений.
+
+Пойдем через регуляризацию, для начала подберем оптимальные значения альфа для ridge- и lasso-регуляризации
+"""
+
+ridge_cv = RidgeCV(alphas=[0.1, 1, 10, 100], cv=5).fit(X_train, y_train)
+lasso_cv = LassoCV(alphas=[0.001, 0.01, 0.1, 1], cv=5, max_iter=10000).fit(X_train, y_train)
+
+print("Лучший alpha для Ridge:", ridge_cv.alpha_)
+print("Лучший alpha для Lasso:", lasso_cv.alpha_)
+
+# Ridge
+ridge = Ridge(alpha=1.0, random_state=42)
+ridge.fit(X_train, y_train)
+y_pred_ridge = ridge.predict(X_test)
+add_results("Ridge (α=1.0)", y_test, y_pred_ridge)
+
+# Lasso
+lasso = Lasso(alpha=0.001, random_state=42, max_iter=10000)
+lasso.fit(X_train, y_train)
+y_pred_lasso = lasso.predict(X_test)
+add_results("Lasso (α=0.001)", y_test, y_pred_lasso)
+
+print(results)
+
+"""Регуляризация не очень помогает, поэтому будем действовать более экстремально"""
+
+xgb = XGBRegressor(
+    n_estimators=5000,
+    learning_rate=0.08,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.0,
+    reg_lambda=1.0,
+    random_state=42,
+    n_jobs=-1
+)
+xgb.fit(
+    X_tr, y_tr,
+    verbose = False,
+    eval_set=[(X_val, y_val)],
+)
+
+y_pred_xgb = xgb.predict(X_test)
+add_results("XGB", y_test, y_pred_xgb)
+
+print(results)
+
+cb = CatBoostRegressor(
+    iterations=5000,
+    learning_rate=0.06,
+    depth=8,
+    l2_leaf_reg=3.0,
+    random_seed=42,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    verbose=False
+)
+
+cb.fit(
+    X_tr, y_tr,
+    eval_set=(X_val, y_val),
+    use_best_model=True,
+    early_stopping_rounds=200,
+)
+
+y_pred_cb = cb.predict(X_test)
+add_results("CatBoost", y_test, y_pred_xgb)
+
+print(results)
+
+lgbm = LGBMRegressor(
+    n_estimators=5000,
+    learning_rate=0.08,
+    num_leaves=63,
+    min_data_in_leaf=30,
+    feature_fraction=0.8,
+    bagging_fraction=0.8,
+    bagging_freq=1,
+    reg_lambda=1.0,
+    reg_alpha=0.0,
+    random_state=42
+)
+
+lgbm.fit(
+    X_tr, y_tr,
+    eval_set=[(X_val, y_val)],
+    eval_metric="rmse",
+)
+
+y_pred_lgbm = lgbm.predict(X_test)
+add_results("LightGBM", y_test, y_pred_lgbm)
+
+print(results)
